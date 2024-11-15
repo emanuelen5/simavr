@@ -227,16 +227,32 @@ avr_interrupt_reti(
 					table->running[table->running_ptr-1]->vector : 0);
 }
 
+static int bootloader_size_avr328(avr_t *avr)
+{
+	const char efuse = avr->fuse[2];
+	const char bootsz = (efuse >> 1) & 0x3;
+
+	switch (bootsz)
+	{
+	case 0:
+		return 256;
+	case 1:
+		return 512;
+	case 2:
+		return 1024;
+	default:
+		return 2048;
+	}
+}
+
 static int interrupt_table_offset(avr_t *avr)
 {
 	const int mcucr = _SFR_IO8(0x35);
 	const int ivsel = 1;
 	const char interrupt_sector_moved_to_bootloader = avr->data[mcucr] & (1 << ivsel);
 
-	const int bootloader_size = 0x800;
-
 	if (interrupt_sector_moved_to_bootloader)
-		return avr->flashend - bootloader_size + 1;
+		return avr->flashend - bootloader_size_avr328(avr) + 1;
 
 	return 0;
 }
