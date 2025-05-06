@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 
 #ifdef HAVE_LIBELF
 #include <libelf.h>
@@ -46,6 +47,11 @@
 #ifndef O_BINARY
 #define O_BINARY 0
 #endif
+
+/* Section names for log messages. */
+
+static const char * const mem_image[] = { "Flash", "Data", "EEPROM", "Fuses",
+										  "Lock", "Unknown" };
 
 #if CONFIG_SIMAVR_TRACE && ELF_SYMBOLS
 // Put a symbol name in a table, preferring names without leadling '_'.
@@ -84,11 +90,48 @@ avr_spread_lines(const char **table, int count)
 }
 #endif
 
+static void do_chunk(fw_chunk_t *chunk, uint8_t *buf,
+					 uint32_t limit, uint32_t *end)
+{
+	uint32_t size, csize, fsize;
+
+	csize = chunk->size;
+	fsize = chunk->fill_size;
+	if (fsize < csize)
+		csize = fsize;	// Unlikely.
+	size = (fsize > csize) ? fsize : csize;
+	if (chunk->addr + size > limit) {
+		AVR_LOG(NULL, LOG_ERROR,
+				"Loading %d bytes of %s data at %x would overflow "
+				"buffer (%d bytes).\n",
+				size, mem_image[chunk->type], chunk->addr, limit);
+		if (chunk->addr >= limit)
+			return;
+		size = limit - chunk->addr;
+	}
+	if (csize > size)
+		csize = size;
+	if (csize) {
+		memcpy(buf + chunk->addr, chunk->data, csize);
+		fsize -= csize;
+	}
+	if (fsize > size)
+		fsize = size;
+	if (fsize)
+		memset(buf + chunk->addr + csize, 0, fsize);
+	AVR_LOG(NULL, LOG_DEBUG, "Loaded %d bytes of %s data at %#x\n",
+			size, mem_image[chunk->type], chunk->addr);
+	if (end && chunk->addr + size > *end)
+		*end = chunk->addr + size;
+}
+
 void
 avr_load_firmware(
 		avr_t * avr,
 		elf_firmware_t * firmware)
 {
+	fw_chunk_t *chunk, *ochunk;
+
 	if (firmware->frequency)
 		avr->frequency = firmware->frequency;
 	if (firmware->vcc)
@@ -101,7 +144,7 @@ avr_load_firmware(
 #if CONFIG_SIMAVR_TRACE
 	/* Store the symbols read from the ELF file. */
 
-	int           scount = firmware->flashsize >> 1;
+	int           scount = avr->flashend >> 1;
 	uint32_t      addr;
 	const char ** table;
 
@@ -130,7 +173,7 @@ avr_load_firmware(
 
 		new = firmware->symbol[i]->symbol;
 		addr = firmware->symbol[i]->addr;
-		if (addr < firmware->flashsize) {
+		if (addr < avr->flashend) {
 			// A code address.
 
 			sp = &table[addr >> 1];
@@ -166,23 +209,82 @@ avr_load_firmware(
 #endif
 #endif // ELF_SYMBOLS
 
-	avr_loadcode(avr, firmware->flash,
-			firmware->flashsize, firmware->flashbase);
-	avr->codeend = firmware->flashsize +
-			firmware->flashbase - firmware->datasize;
+	/* Load. */
 
-	if (firmware->eeprom && firmware->eesize) {
-		avr_eeprom_desc_t d = {
-				.ee = firmware->eeprom,
-				.offset = firmware->eeprombase,
-				.size = firmware->eesize
-		};
-		avr_ioctl(avr, AVR_IOCTL_EEPROM_SET, &d);
+	for (chunk = firmware->chunks; chunk; ) {
+		avr_eeprom_desc_t ed;
+
+		if (chunk->type == UNKNOWN) {
+			/* Classify chunk based on address and subtract base of region. */
+
+			if (chunk->addr < AVR_SEGMENT_OFFSET_DATA) {
+				/* Explicit flash section. Load it. */
+
+				chunk->type = FLASH;
+			} else if (chunk->addr < AVR_SEGMENT_OFFSET_EEPROM) {
+				/* Data space.  Usually only for .bss, and that may be ignored.
+				 * If there are initialised variables, they appear as
+				 * extra initialised flash.  The C startup function
+				 * understands that and will copy them to RAM, and also
+				 * zeros .bss.  There might be some reason to load into
+				 * data space ...
+				 */
+
+				chunk->type = DATA;
+				chunk->addr -= AVR_SEGMENT_OFFSET_DATA;
+			} else if (chunk->addr < AVR_SEGMENT_OFFSET_FUSES) {
+				/* EEPROM. */
+
+				chunk->type = EEPROM;
+				chunk->addr -= AVR_SEGMENT_OFFSET_EEPROM;
+			} else if (chunk->addr < AVR_SEGMENT_OFFSET_LOCK) {
+				/* Fuses. */
+
+				chunk->type = FUSES;
+				chunk->addr -= AVR_SEGMENT_OFFSET_FUSES;
+			} else if (chunk->addr < AVR_SEGMENT_OFFSET_LAST) {
+				/* Lock bits. */
+
+				chunk->type = LOCK;
+				chunk->addr -= AVR_SEGMENT_OFFSET_LOCK;
+			}
+		}
+
+		switch (chunk->type) {
+		case FLASH:
+			do_chunk(chunk, avr->flash, avr->flashend, &avr->codeend);
+			break;
+		case DATA:
+			do_chunk(chunk, avr->data + avr->ioend, avr->ramend - avr->ioend,
+					 NULL);
+			break;
+		case EEPROM:
+			if (chunk->size) {
+				ed.ee = chunk->data;
+				ed.offset = chunk->addr;
+				ed.size = chunk->size;
+			}
+			if (avr_ioctl(avr, AVR_IOCTL_EEPROM_SET, &ed) < 0) {
+				AVR_LOG(avr, LOG_ERROR,
+						"Failed to write %d bytes to EEPROM at offset %#x\n",
+						chunk->size, chunk->addr);
+			}
+			break;
+		case FUSES:
+			do_chunk(chunk, avr->fuse, sizeof avr->fuse, NULL);
+			break;
+		case LOCK:
+			do_chunk(chunk, &avr->lockbits, sizeof avr->lockbits, NULL);
+			break;
+		default:
+			AVR_LOG(avr, LOG_ERROR, "Ignoring unknown (type %d) data chunk\n",
+					chunk->type);
+			break;
+		}
+		ochunk = chunk;
+		chunk = chunk->next;
+		free(ochunk);
 	}
-	if (firmware->fuse)
-		memcpy(avr->fuse, firmware->fuse, firmware->fusesize);
-	if (firmware->lockbits)
-		avr->lockbits = firmware->lockbits[0];
 	// load the default pull up/down values for ports
 	for (int i = 0; i < 8 && firmware->external_state[i].port; i++) {
 		avr_ioport_external_t e = {
@@ -205,7 +307,7 @@ avr_load_firmware(
 		avr->vcd,
 		firmware->traceperiod >= 1000 ? firmware->traceperiod : 1000);
 
-	AVR_LOG(avr, LOG_TRACE, "Creating VCD trace file '%s'\n",
+	AVR_LOG(avr, LOG_TRACE, "ELF: Creating VCD trace file '%s'\n",
 			avr->vcd->filename);
 
 	for (int ti = 0; ti < firmware->tracecount; ti++) {
@@ -228,8 +330,32 @@ avr_load_firmware(
 						&bit[firmware->trace[ti].addr],
 						firmware->trace[ti].mask == 0xff ? 8 : 1,
 						firmware->trace[ti].name);
+		} else if ( (firmware->trace[ti].kind == AVR_MMCU_TAG_VCD_SRAM_8) ||
+		    (firmware->trace[ti].kind == AVR_MMCU_TAG_VCD_SRAM_16) ) {
+			if ((firmware->trace[ti].addr <= 31) || (firmware->trace[ti].addr > avr->ramend)) {
+				AVR_LOG(avr, LOG_ERROR, "ELF: *** Invalid SRAM trace address (0x20 < 0x%04x < 0x%04x )\n", firmware->trace[ti].addr, avr->ramend);
+			} else if (avr->sram_tracepoint_count >= ARRAY_SIZE(avr->sram_tracepoint)) {
+				AVR_LOG(avr, LOG_ERROR, "ELF: *** Too many SRAM traces (limit = %d)\n", ARRAY_SIZE(avr->sram_tracepoint));
+			} else {
+				char name[20];
+				sprintf(name, "sram_tracepoint_%d", avr->sram_tracepoint_count);
+				const char *names[1] = {name};
+				avr_irq_t *irq = avr_alloc_irq(&avr->irq_pool, 0, 1, names);
+				if (irq) {
+					AVR_LOG(avr, LOG_OUTPUT, "ELF: SRAM tracepoint added at '0x%04x' (%s, %d bits)\n", firmware->trace[ti].addr, firmware->trace[ti].name, firmware->trace[ti].kind == AVR_MMCU_TAG_VCD_SRAM_8 ? 8 : 16);
+					avr->sram_tracepoint[avr->sram_tracepoint_count].irq = irq;
+					avr->sram_tracepoint[avr->sram_tracepoint_count].width = firmware->trace[ti].kind == AVR_MMCU_TAG_VCD_SRAM_8 ? 8 : 16;
+					avr->sram_tracepoint[avr->sram_tracepoint_count].addr = firmware->trace[ti].addr;
+					avr_vcd_add_signal(avr->vcd,
+						irq,
+						avr->sram_tracepoint[avr->sram_tracepoint_count].width,
+						firmware->trace[ti].name[0] ? firmware->trace[ti].name : names[0]
+					);
+					avr->sram_tracepoint_count++;
+				}
+			}
 		} else if (firmware->trace[ti].mask == 0xff ||
-				firmware->trace[ti].mask == 0) {
+					firmware->trace[ti].mask == 0) {
 			// easy one
 			avr_irq_t * all = avr_iomem_getirq(avr,
 					firmware->trace[ti].addr,
@@ -330,7 +456,9 @@ elf_parse_mmcu_section(
 			}	break;
 			case AVR_MMCU_TAG_VCD_PORTPIN:
 			case AVR_MMCU_TAG_VCD_IRQ:
-			case AVR_MMCU_TAG_VCD_TRACE: {
+			case AVR_MMCU_TAG_VCD_TRACE:
+			case AVR_MMCU_TAG_VCD_SRAM_8:
+			case AVR_MMCU_TAG_VCD_SRAM_16: {
 				uint8_t mask = src[0];
 				uint16_t addr = src[1] | (src[2] << 8);
 				char * name = (char*)src + 3;
@@ -366,6 +494,7 @@ elf_parse_mmcu_section(
 	}
 }
 
+#if 0
 static int
 elf_copy_segment(int fd, Elf32_Phdr *php, uint8_t **dest)
 {
@@ -385,7 +514,7 @@ elf_copy_segment(int fd, Elf32_Phdr *php, uint8_t **dest)
 				rv, php->p_filesz, php->p_vaddr, php->p_offset);
 		return -1;
 	}
-	AVR_LOG(NULL, LOG_DEBUG, "Loaded %d bytes at %x\n",
+	AVR_LOG(NULL, LOG_DEBUG, "ELF: Loaded %d bytes at %x\n",
 			php->p_filesz, php->p_vaddr);
 	return 0;
 }
@@ -403,6 +532,7 @@ elf_handle_segment(int fd, Elf32_Phdr *php, uint8_t **dest, const char *name)
 		return 0;
 	}
 }
+#endif
 
 /* The structure *firmware must be pre-initialised to zero, then optionally
  * tracing and VCD information may be added.
@@ -413,12 +543,13 @@ elf_read_firmware(
 	const char * file,
 	elf_firmware_t * firmware)
 {
-	Elf32_Ehdr  elf_header;			/* ELF header */
-	Elf        *elf = NULL;         /* Our Elf pointer for libelf */
-	Elf32_Phdr *php;				/* Program header. */
-	Elf_Scn    *scn = NULL;         /* Section Descriptor */
-	size_t      ph_count;           /* Program Header entry count. */
-	int         fd, i;              /* File Descriptor */
+	Elf32_Ehdr   elf_header;				/* ELF header */
+	Elf         *elf = NULL;				/* Our Elf pointer for libelf */
+	Elf32_Phdr  *php;						/* Program header. */
+	Elf_Scn     *scn = NULL;				/* Section Descriptor */
+	fw_chunk_t **ncp;						/* Loadable file contents. */
+	size_t       ph_count;					/* Program Header entry count. */
+	int          fd, i;						/* File Descriptor */
 
 	if ((fd = open(file, O_RDONLY | O_BINARY)) == -1 ||
 			(read(fd, &elf_header, sizeof(elf_header))) < sizeof(elf_header)) {
@@ -457,7 +588,9 @@ elf_read_firmware(
 		return -1;
 	}
 
+	ncp = &firmware->chunks;
 	for (i = 0; i < (int)ph_count; ++i, ++php) {
+		fw_chunk_t    *chunk;
 #if 0
 		printf("Header %d type %d addr %x/%x size %d/%d flags %x\n",
 			   i, php->p_type, php->p_vaddr, php->p_paddr,
@@ -465,55 +598,50 @@ elf_read_firmware(
 #endif
 		if (php->p_type != PT_LOAD || php->p_filesz == 0)
 			continue;
-		if (php->p_vaddr < 0x800000) {
-			/* Explicit flash section. Load it. */
-
-			if (elf_handle_segment(fd, php, &firmware->flash, "Flash"))
-				continue;
-			firmware->flashsize = php->p_filesz;
-			firmware->flashbase = php->p_vaddr;
-		} else if (php->p_vaddr < 0x810000) {
-			/* Data space.  If there are initialised variables, treat
-			 * them as extra initialised flash.  The C startup function
-			 * understands that and will copy them to RAM.
-			 */
-
-			if (firmware->flash) {
-				uint8_t *where;
-
-				firmware->flash = realloc(firmware->flash,
-										  firmware->flashsize + php->p_filesz);
-				if (!firmware->flash)
-					return -1;
-				where = firmware->flash + firmware->flashsize;
-				elf_copy_segment(fd, php, &where);
-				firmware->flashsize += php->p_filesz;
-			} else {
-				/* If this ever happens, add a second pass. */
-
-				AVR_LOG(NULL, LOG_ERROR,
-						"Initialialised data but no flash (%d bytes at %x)!\n",
-						php->p_filesz, php->p_vaddr);
-				return -1;
-			}
-		} else if (php->p_vaddr < 0x820000) {
-			/* EEPROM. */
-
-			if (elf_handle_segment(fd, php, &firmware->eeprom, "EEPROM"))
-				continue;
-			firmware->eesize = php->p_filesz;
-			firmware->eeprombase = php->p_vaddr - 0x820000;
-		} else if (php->p_vaddr < 0x830000) {
-			/* Fuses. */
-
-			if (elf_handle_segment(fd, php, &firmware->fuse, "Fuses"))
-				continue;
-			firmware->fusesize = php->p_filesz;
-		} else if (php->p_vaddr < 0x840000) {
-			/* Lock bits. */
-
-			elf_handle_segment(fd, php, &firmware->lockbits, "Lock bits");
+		if (php->p_paddr >= AVR_SEGMENT_OFFSET_LAST) {
+			continue; // Probably .mmcu
 		}
+
+		if (php->p_filesz == 0 && php->p_memsz == 0)
+			continue;		// Unlikely!
+
+		/* Allocate a chunk to store this information. */
+
+		chunk = (fw_chunk_t *)malloc(sizeof (fw_chunk_t) + php->p_filesz);
+		if (!chunk) {
+			AVR_LOG(NULL, LOG_ERROR, "No memory for firmware!\n");
+			exit(1);
+		}
+		chunk->type = UNKNOWN; // Classify later,
+		chunk->addr = php->p_paddr;
+		chunk->size = php->p_filesz;
+		chunk->fill_size = php->p_memsz;
+		chunk->next = NULL;
+		if (php->p_filesz) {
+			int rv;
+
+			/* Read the data. */
+
+			if (lseek(fd, php->p_offset, SEEK_SET) < 0) {
+				AVR_LOG(NULL, LOG_ERROR,
+						"Error when seeking %d bytes for %x at offset %d "
+						"from ELF file: %s\n",
+						php->p_filesz, php->p_vaddr, php->p_offset,
+						strerror(errno));
+				exit(1);
+			}
+			rv = read(fd, chunk->data, php->p_filesz);
+			if (rv != php->p_filesz) {
+				AVR_LOG(NULL, LOG_ERROR,
+						"Got %d when reading %d bytes for %x at offset %d "
+						"from ELF file: %s\n",
+						rv, php->p_filesz, php->p_vaddr, php->p_offset,
+						strerror(errno));
+				exit(1);
+			}
+		}
+		*ncp = chunk;
+		ncp = &chunk->next;
 	}
 
 	/* Scan the section table for .mmcu magic and symbols. */
@@ -527,7 +655,7 @@ elf_read_firmware(
 		char * name = elf_strptr(elf, elf_header.e_shstrndx, shdr.sh_name);
 		//	printf("Walking elf section '%s'\n", name);
 
-		if (!strcmp(name, ".mmcu")) {
+		if (name && !strcmp(name, ".mmcu")) {
 			Elf_Data *s = elf_getdata(scn, NULL);
 
 			elf_parse_mmcu_section(firmware, s->d_buf, s->d_size);

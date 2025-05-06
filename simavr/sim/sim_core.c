@@ -71,7 +71,7 @@ int dont_trace(const char * name)
 
 static int donttrace;
 
-static const char *where(avr_t *avr)
+const char *avr_where(avr_t *avr)
 {
 	avr_flashaddr_t  pc;
 	const char      *s;
@@ -100,8 +100,8 @@ static const char *where(avr_t *avr)
 	return "";
 }
 
-#define STATE(_f, argsf ...)	if (avr->trace) {				\
-	const char *symn = where(avr);							\
+#define STATE(_f, argsf ...)	if (avr->trace) {			\
+	const char *symn = avr_where(avr);						\
 	if (symn)												\
 		printf("%04x: %-25s " _f, avr->pc, symn, ## argsf);	\
 }
@@ -126,7 +126,7 @@ static const char *get_data_address_string(avr_t* avr, uint16_t addr)
 }
 
 #define DAS(addr) get_data_address_string(avr, addr)
-#define FAS(addr) (((addr >> 1) > avr->trace_data->codeline_size) ? \
+#define FAS(addr) (((addr >> 1) >= avr->trace_data->codeline_size) ? \
                    "[not loaded]" : avr->trace_data->codeline[addr >> 1])
 
 void crash(avr_t* avr)
@@ -161,6 +161,8 @@ void crash(avr_t* avr)
 	avr_sadly_crashed(avr, 0);
 
 }
+
+const char *avr_where(avr_t *avr) { return ""; }
 #endif
 
 static inline uint16_t
@@ -181,6 +183,28 @@ static inline void _call_register_irqs(avr_t * avr, uint16_t addr)
 			avr_raise_irq(avr->io[io].irq + AVR_IOMEM_IRQ_ALL, v);
 			for (int i = 0; i < 8; i++)
 				avr_raise_irq(avr->io[io].irq + i, (v >> i) & 1);
+		}
+	}
+}
+
+void _call_sram_irqs(avr_t *avr, uint16_t addr) {
+	for(int tracepoint=0; tracepoint < avr->sram_tracepoint_count; tracepoint++) {
+
+		if (avr->sram_tracepoint[tracepoint].width == 16) {
+			// 16 bits trace (LSB/addr or MSB/addr+1 may be accessed)
+			if (avr->sram_tracepoint[tracepoint].addr == addr) {
+				uint16_t v = (avr->data[addr+1] << 8) | avr->data[addr]; // LSB
+				avr_raise_irq(avr->sram_tracepoint[tracepoint].irq, v);
+			} else if (avr->sram_tracepoint[tracepoint].addr == addr - 1) {
+				uint16_t v = (avr->data[addr] << 8) | avr->data[addr-1]; // MSB
+				avr_raise_irq(avr->sram_tracepoint[tracepoint].irq, v);
+			}
+		} else {
+			// 8 bits trace
+			if (avr->sram_tracepoint[tracepoint].addr == addr) {
+				uint8_t v = avr->data[addr];
+				avr_raise_irq(avr->sram_tracepoint[tracepoint].irq, v);
+			}
 		}
 	}
 }
@@ -220,6 +244,7 @@ void avr_core_watch_write(avr_t *avr, uint16_t addr, uint8_t v)
 
 	avr->data[addr] = v;
 	_call_register_irqs(avr, addr);
+	_call_sram_irqs(avr, addr);
 }
 
 uint8_t avr_core_watch_read(avr_t *avr, uint16_t addr)
@@ -269,6 +294,8 @@ static inline void _avr_set_r(avr_t * avr, uint16_t r, uint8_t v)
 					avr_raise_irq(avr->io[io].irq + i, (v >> i) & 1);
 			}
 		}
+        // _call_register_irqs(avr, r); // else section above could then be removed ?
+		_call_sram_irqs(avr, r); // Only for io region
 	} else
 		avr->data[r] = v;
 }

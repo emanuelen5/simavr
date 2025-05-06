@@ -167,6 +167,7 @@ typedef struct avr_t {
 	uint32_t			flashend;
 	uint32_t			e2end;
 	uint8_t				vector_size;
+	uint8_t				resetting; // Set only during avr_reset().
 	// accessible via LPM (BLBSET)
 	uint8_t				fuse[6];
 	uint8_t				lockbits;
@@ -309,6 +310,15 @@ typedef struct avr_t {
 			void * c;
 		} io[4];
 	} io_shared_io[4];
+
+    // SRAM tracepoint
+    #define SRAM_TRACEPOINT_SIZE 16
+	int				sram_tracepoint_count;
+	struct {
+		struct avr_irq_t * irq;
+		int width;
+		uint16_t addr;
+	} sram_tracepoint[SRAM_TRACEPOINT_SIZE];
 
 	// flash memory (initialized to 0xff, and code loaded into it)
 	uint8_t *		flash;
@@ -492,6 +502,12 @@ avr_pending_sleep_usec(
 uint64_t
 avr_get_time_stamp(
 		avr_t * avr );
+
+/* This function returns a text string describing where in flash the AVR's
+ * PC is pointing.  It requires the CONFIG_SIMAVR_TRACE option.
+ */
+
+const char *avr_where(avr_t *avr);
 
 #ifdef __cplusplus
 };
